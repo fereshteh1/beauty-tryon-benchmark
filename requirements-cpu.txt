@@ -1,0 +1,5 @@
+# Image, protocol and notebook tests only. No models or GPU inference.
+numpy==1.26.4
+Pillow==10.4.0
+opencv-python-headless==4.10.0.84
+nbformat==5.10.4
