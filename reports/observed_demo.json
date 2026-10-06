@@ -1,0 +1,40 @@
+{
+  "schema_version": 2,
+  "source": "Saved outputs in the publicly shared professional Colab prototype, inspected directly from the linked notebook.",
+  "source_url": "https://colab.research.google.com/drive/1B8Mj0FYPIQ4B9N0EQ2L5t2udpY1YKp4t?usp=sharing",
+  "observation_date": "2026-10-05",
+  "scope": "linked_professional_colab_single_demo",
+  "gpu": "Tesla T4",
+  "environment": {
+    "python": "3.10.17",
+    "torch": "2.2.2+cu121",
+    "cuda_runtime": "12.1",
+    "precision": "float32",
+    "seed": 3407
+  },
+  "checks": {
+    "cuda_arithmetic": "PASS",
+    "core_tests": "12/12 PASS",
+    "runtime_tests": "9/9 PASS",
+    "pinned_operator_test": "PASS"
+  },
+  "repository_release_equivalence": "NOT_CLAIMED",
+  "full_30_image_gate": "NOT_RUN",
+  "observations": [
+    {
+      "engine": "hairstyle",
+      "inference_s": 2.061,
+      "pipeline_s": 10.242,
+      "peak_allocated_mib": 6905.4,
+      "status": "ok"
+    },
+    {
+      "engine": "color",
+      "inference_s": 0.142,
+      "pipeline_s": 0.151,
+      "peak_allocated_mib": 305.2,
+      "status": "ok"
+    }
+  ],
+  "note": "Single-demo feasibility evidence only. The 30-image human-quality benchmark remains pending, and the linked professional Colab prototype is not claimed to be byte-for-byte identical to every repository revision."
+}
