@@ -4,9 +4,9 @@
 
 Use 30 target portraits, one anonymous ID per target, and an explicit reference for hairstyle cases. Group A: 10 well-lit, frontal, unobstructed salon portraits. Group B: 10 portraits at approximately 30–45 degrees with warm lighting, curly/frizzy hair, glasses or strands on the forehead. Group C: 10 direct mobile photos under real salon conditions. A group label is an evaluator declaration, not something the code can verify from the image.
 
-`examples/manifest.json` has all 30 required IDs and path placeholders. It contains no photographs; replace paths with actual members of your local ZIP. Keep `manifest.json` at the archive root. A ZIP can contain `targets/A01.jpg` and `references/style01.jpg`. Do not give images people's names. The same sreference may be reused; ZIP member bytes are zeroed only after their final use.
+`examples/manifest.json` has all 30 required IDs and path placeholders. It contains no photographs; replace paths with actual members of your local ZIP. Keep `manifest.json` at the archive root. A ZIP can contain `targets/A01.jpg` and `references/style01.jpg`. Do not give images people's names. The same reference may be reused; ZIP member bytes are zeroed only after their final use.
 
-Partial batches are useful for debugging but produce INCOMPLETE. Duplicate IDs, invalid relative paths or missing members are rejected. ZIP size is limited to 256 MiB at selection, 512 MiB total uncompressed, 256 entries, 25 MiB per entry and compression ratio ≄200. Encrypted ZIPs are rejected. It is never extracted by the pipeline.
+Partial batches are useful for debugging but produce INCOMPLETE. Duplicate IDs, invalid relative paths or missing members are rejected. ZIP size is limited to 256 MiB at selection, 512 MiB total uncompressed, 256 entries, 25 MiB per entry and compression ratio ≤200. Encrypted ZIPs are rejected. It is never extracted by the pipeline.
 
 ## Ratings
 
@@ -32,7 +32,7 @@ Private Colab batches use a transient comparison plus a three-integer prompt. Hu
 - `decode_s`: decode, EXIF orientation and creation of clean RGB input.
 - `provenance.startup.model_load_s` / `warmup_s`: initialization and public warmup, separately reported in readiness metadata. First initialization can include public backbone downloads. `init_peak_allocated_mib` / `init_peak_reserved_mib` cover model loading before warmup and are separate from inference peaks.
 - Peak allocated/reserved: CUDA allocator maximum; resident weights are included. Startup memory is not this inference metric.
-- NVML process/device peak: sampled every 10 ms; shorter spikes may be missed. Missing NVMLreadings remain null.
+- NVML process/device peak: sampled every 10 ms; shorter spikes may be missed. Missing NVML readings remain null.
 
 Record GPU, source/weight/model revisions, resolved requirements checksum, requested/actual operator backend, FP32 profile, seed 3407, and repetitions. CUDA fused and PyTorch reference runs should be compared as separate backend profiles. The seed helps comparison but does not guarantee bitwise determinism across drivers or kernels.
 
