@@ -1,454 +1,497 @@
-"""Benchmark controller: framed worker IPC, privacy-aware previews, batches and gates."""
-from __future__ import annotations
-
-import contextlib
-import csv
-import io
-import json
-import math
-import os
+# Notebook control plane: stdlib only. Image arrays live in the isolated model worker.
+import os, io, sys, json, time, gc, struct, pickle, subprocess, contextlib, zipfile, re, csv
 from pathlib import Path, PurePosixPath
-import pickle
-import select
-import struct
-import subprocess
-import threading
-import time
-import zipfile
+from collections import Counter
+import select, threading
+from collections import deque
 
-from core import wipe
-
-PRIVATE_IMAGES = True
-ROOT = Path(os.environ.get("BEAUTY_ROOT", "/content/beauty_phase0")).resolve()
-CODE_ROOT = Path(__file__).resolve().parent
-PYTHON = str(ROOT / "venv/bin/python")
-ENV = dict(os.environ)
+PRIVATE_IMAGES = True       # Default: no image display, no return, no image export.
+# Set False ONLY for public/synthetic benchmark images. Colab is not an audited private backend.
 CLIENT = None
-MAX_IPC_BYTES = 80 * 1024 * 1024
-ALLOWED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
-
+MAX_IPC = 128 * 1024 * 1024
 
 def configure(root, code_root, python, env):
     global ROOT, CODE_ROOT, PYTHON, ENV
-    ROOT = Path(root).resolve()
-    CODE_ROOT = Path(code_root).resolve()
-    PYTHON = str(python)
-    ENV = dict(env)
+    ROOT, CODE_ROOT = Path(root), Path(code_root)
+    PYTHON, ENV = str(python), dict(env)
 
 
-def clear_buffer(value):
-    if value is not None:
-        wipe(value)
+def clear_buffer(buffer):
+    if isinstance(buffer, bytearray):
+        buffer[:] = b'\0' * len(buffer)
+    elif isinstance(buffer, io.BytesIO):
+        if buffer.closed:
+            return
+        view = buffer.getbuffer()
+        try:
+            view[:] = b'\0' * len(view)
+        finally:
+            view.release()
+            buffer.close()
 
 
-def recv_exact(stream, length, deadline):
-    out = bytearray()
-    while len(out) < length:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError("worker_ipc_timeout")
-        ready, _, _ = select.select([stream], [], [], remaining)
-        if not ready:
-            raise TimeoutError("worker_ipc_timeout")
-        chunk = os.read(stream.fileno(), length - len(out))
-        if not chunk:
-            raise EOFError("worker_ipc_closed")
-        out.extend(chunk)
-    return bytes(out)
-
-
-def _send(stream, value):
-    payload = pickle.dumps(value, protocol=5)
-    if len(payload) > MAX_IPC_BYTES:
-        raise ValueError("ipc_payload_too_large")
-    stream.write(struct.pack("!Q", len(payload)))
-    stream.write(payload)
-    stream.flush()
-
-
-def _recv(stream, timeout=1800):
-    deadline = time.monotonic() + timeout
-    header = recv_exact(stream, 8, deadline)
-    length = struct.unpack("!Q", header)[0]
-    if length > MAX_IPC_BYTES:
-        raise ValueError("ipc_payload_too_large")
-    return pickle.loads(recv_exact(stream, length, deadline))
+def recv_exact(stream, size, deadline=None):
+    buffer = bytearray(size)
+    view = memoryview(buffer)
+    offset = 0
+    while offset < size:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([stream], [], [], remaining)[0]:
+                clear_buffer(buffer)
+                raise TimeoutError('model_response_timeout')
+        n = stream.readinto(view[offset:])
+        if not n:
+            clear_buffer(buffer)
+            raise RuntimeError('Model worker stopped; restart with start_engine().')
+        offset += n
+    view.release()
+    return buffer
 
 
 class ModelClient:
-    def __init__(self, service, timeout=1800):
+    def __init__(self, service):
+        if service not in {'hairstyle', 'color'}:
+            raise ValueError('Service must be hairstyle or color.')
         self.service = service
-        self.timeout = timeout
-        self.lock = threading.Lock()
-        worker = CODE_ROOT / "worker.py"
-        if not worker.is_file():
-            raise RuntimeError("worker.py is missing; regenerate derived sources first")
-        child_env = dict(ENV)
-        child_env.setdefault("BEAUTY_ROOT", str(ROOT))
-        child_env.setdefault("BEAUTY_WORKER_NO_IMAGE_WRITE", "1" if PRIVATE_IMAGES else "0")
-        self.process = subprocess.Popen(
-            [PYTHON, str(worker), service],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-            env=child_env,
-        )
+        self.initializing = True
+        self.init_logs = deque(maxlen=60)
+        self.process = subprocess.Popen([PYTHON, str(CODE_ROOT / 'worker.py'), service],
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, env=ENV, bufsize=0)
+        def drain():
+            for raw in iter(self.process.stderr.readline, b''):
+                if self.initializing:
+                    line = raw.decode('utf-8', errors='replace')
+                    self.init_logs.append(line)
+                    print(line, end='', flush=True)
+                # Request-time third-party output is discarded for private inputs.
+        self.log_thread = threading.Thread(target=drain, daemon=True)
+        self.log_thread.start()
         try:
-            ready = _recv(self.process.stdout, timeout)
+            ready = self._receive(timeout=1800)
         except Exception as exc:
-            diagnostic = self._stderr_text()
-            self.close(kill=True)
-            raise RuntimeError(diagnostic or str(exc)) from exc
-        if not isinstance(ready, dict) or ready.get("status") != "ready":
-            diagnostic = self._stderr_text()
-            self.close(kill=True)
-            raise RuntimeError(diagnostic or str(ready))
+            self.close()
+            raise RuntimeError('Model initialization failed:\n' + ''.join(self.init_logs)
+                               + '\nTransport: ' + str(exc)) from exc
+        if ready.get('status') != 'ready':
+            self.close()
+            raise RuntimeError('Model initialization failed:\n' + ''.join(self.init_logs))
+        self.initializing = False
+        self.ready = ready
 
-    def _stderr_text(self):
-        if self.process.stderr is None:
-            return ""
+    def _receive(self, timeout=180):
+        deadline = time.monotonic() + timeout
+        header = recv_exact(self.process.stdout, 8, deadline)
+        size = struct.unpack('!Q', header)[0]
+        if size > MAX_IPC:
+            raise RuntimeError('IPC message too large.')
+        body = recv_exact(self.process.stdout, size, deadline)
         try:
-            if self.process.poll() is None:
-                return ""
-            data = self.process.stderr.read() or b""
-            return data.decode("utf-8", "replace")[-8000:]
-        except Exception:
-            return ""
+            return pickle.loads(body)
+        finally:
+            clear_buffer(body)
 
     def call(self, request):
-        with self.lock:
-            if self.process.poll() is not None:
-                raise RuntimeError(self._stderr_text() or "worker_not_running")
-            try:
-                _send(self.process.stdin, request)
-                return _recv(self.process.stdout, self.timeout)
-            except Exception as exc:
-                diagnostic = self._stderr_text()
-                if diagnostic:
-                    raise RuntimeError(diagnostic) from exc
-                raise
-
-    def close(self, kill=False):
-        process = getattr(self, "process", None)
-        if process is None or process.poll() is not None:
-            return
-        if not kill:
-            try:
-                _send(process.stdin, {"op": "stop"})
-                _recv(process.stdout, 5)
-            except Exception:
-                kill = True
-        if kill and process.poll() is None:
-            process.kill()
+        if self.process.poll() is not None:
+            raise RuntimeError('Worker not running.')
+        body = bytearray(pickle.dumps(request, protocol=5))
         try:
-            process.wait(timeout=5)
-        except Exception:
-            process.kill()
+            # FileIO on pipes can short-write. Always write each frame completely.
+            for part in (struct.pack('!Q', len(body)), body):
+                view = memoryview(part)
+                while view:
+                    written = self.process.stdin.write(view)
+                    if not written:
+                        raise RuntimeError('Worker pipe closed.')
+                    view = view[written:]
+                view.release()
+            self.process.stdin.flush()
+            try:
+                return self._receive()
+            except Exception:
+                self.close()
+                raise
+        finally:
+            clear_buffer(body)
 
-
-def start_engine(service):
-    global CLIENT
-    if service not in {"hairstyle", "color"}:
-        raise ValueError("unknown_service")
-    if CLIENT is not None and CLIENT.service == service and CLIENT.process.poll() is None:
-        return CLIENT
-    stop_engine()
-    CLIENT = ModelClient(service)
-    return CLIENT
+    def close(self):
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=10)
+        if hasattr(self, 'log_thread'):
+            self.log_thread.join(timeout=1)
+        for pipe in (self.process.stdin, self.process.stdout, self.process.stderr):
+            if pipe is not None:
+                pipe.close()
 
 
 def stop_engine():
     global CLIENT
-    client, CLIENT = CLIENT, None
-    if client is not None:
-        client.close()
+    if CLIENT is not None:
+        CLIENT.close()
+        CLIENT = None
+    gc.collect()
+
+
+def start_engine(service='hairstyle'):
+    """Keep ONE service resident on GPU. Warmup is public, not measured in scores."""
+    global CLIENT
+    stop_engine()
+    CLIENT = ModelClient(service)
+    print(json.dumps(CLIENT.ready, indent=2))
+
+
+async_file_picker_js = r'''
+new Promise(resolve => {
+  const input = document.createElement('input');
+  input.type = 'file'; input.accept = ACCEPT_TOKEN;
+  input.style.display = 'block';
+  const label = document.createElement('p'); label.textContent = LABEL_TOKEN;
+  document.body.append(label, input);
+  input.oncancel = () => {input.remove(); label.remove(); resolve(null);};
+  input.onchange = async () => {
+    const file = input.files[0];
+    if (!file || file.size > LIMIT_TOKEN) {
+      input.remove(); label.remove(); resolve({error:'invalid_file_size'}); return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const data = String(reader.result).split(',')[1];
+      input.value = ''; input.remove(); label.remove(); resolve({data});
+    };
+    reader.onerror = () => {input.remove(); label.remove(); resolve({error:'read_failed'});};
+    reader.readAsDataURL(file);
+  };
+})
+'''
+
+
+def pick_bytes(label='Choose image', zip_input=False):
+    """FileReader -> memory. Does NOT use google.colab.files.upload (disk write)."""
+    import base64
+    from google.colab.output import eval_js
+    script = async_file_picker_js.replace('ACCEPT_TOKEN', json.dumps('.zip' if zip_input else '.jpg,.jpeg,.png,.webp'))
+    script = script.replace('LABEL_TOKEN', json.dumps(label)).replace('LIMIT_TOKEN', str(256 * 2**20 if zip_input else 25 * 2**20))
+    response = eval_js(script, timeout_sec=300)
+    try:
+        if not response or response.get('error'):
+            raise ValueError('No valid file selected.')
+        return bytearray(base64.b64decode(response['data'], validate=True))
+    finally:
+        if response is not None:
+            response.clear()
+        gc.collect()
 
 
 def show_comparison(png):
     if PRIVATE_IMAGES:
-        raise PermissionError("private_image_display_blocked")
+        raise PermissionError('Image display is disabled for private images: notebook outputs can persist.')
     from IPython.display import display, Image as DisplayImage
     display(DisplayImage(data=bytes(png)))
 
 
-def evaluate(face, reference=None, *, show=False, repeats=1, preview_fn=None,
-             retain_output=False, target_rgb=(116, 52, 40), strength=.85,
-             reference_color=False):
+def evaluate(face_bytes, reference_bytes=None, *, show=False, retain_output=False,
+             repeats=3, target_rgb=(116, 52, 40), strength=.85, reference_color=False, preview_fn=None):
+    """Consumes/zeroes supplied bytearrays. Return only metrics by default.
+    Pure inference excludes uploads/decode/render; pipeline_s includes alignment.
+    """
     if CLIENT is None:
-        raise RuntimeError("engine_not_started")
+        raise RuntimeError('Run start_engine() first.')
+    if PRIVATE_IMAGES and (show or retain_output):
+        raise PermissionError('For private images, display/export/retention is blocked.')
+    if not isinstance(face_bytes, bytearray) or (reference_bytes is not None and not isinstance(reference_bytes, bytearray)):
+        raise TypeError('Use owned bytearray inputs so they can be overwritten.')
     response = None
     try:
-        request = {
-            "op": "evaluate",
-            "face": face,
-            "reference": reference,
-            "repeats": int(repeats),
-            "return_images": bool(show or preview_fn or retain_output),
-            "debug_public": bool(show and not PRIVATE_IMAGES),
-            "target_rgb": list(target_rgb),
-            "strength": float(strength),
-            "reference_color": bool(reference_color),
-        }
-        response = CLIENT.call(request)
-        metrics = dict(response.get("metrics", {}))
-        if metrics.get("status") != "ok":
-            return metrics
-        comparison = response.get("comparison_png")
-        if preview_fn is not None and comparison is not None:
-            preview_fn(comparison)
-        elif show and comparison is not None:
-            show_comparison(comparison)
+        response = CLIENT.call({'op': 'evaluate', 'face': face_bytes, 'reference': reference_bytes,
+                                'repeats': repeats, 'target_rgb': target_rgb, 'strength': strength,
+                                'reference_color': reference_color, 'return_images': show or retain_output or preview_fn is not None,
+                                'debug_public': not PRIVATE_IMAGES})
+        if preview_fn is not None and response['metrics']['status'] == 'ok':
+            preview_fn(response['comparison_png'])
+        if show and response['metrics']['status'] == 'ok':
+            show_comparison(response['comparison_png'])
         if retain_output:
             return response
-        return metrics
+        return response['metrics']
+    finally:
+        clear_buffer(face_bytes)
+        clear_buffer(reference_bytes)
+        if response is not None and not retain_output:
+            clear_buffer(response.get('output_png'))
+            clear_buffer(response.get('comparison_png'))
+        gc.collect()
+
+
+def single_demo(*, show=False, reference_color=False):
+    # No upload data assigned to notebook globals or returned as last-cell output.
+    face = reference = None
+    try:
+        face = pick_bytes('Choose target portrait')
+        if CLIENT is None:
+            raise RuntimeError('Run start_engine first.')
+        if CLIENT.service == 'hairstyle' or reference_color:
+            reference = pick_bytes('Choose hair reference (one face)')
+        metrics = evaluate(face, reference, show=show, reference_color=reference_color)
+        print(json.dumps(metrics, indent=2))
     finally:
         clear_buffer(face)
         clear_buffer(reference)
-        if response is not None and not retain_output:
-            clear_buffer(response.get("output_png"))
-            clear_buffer(response.get("comparison_png"))
-            response.clear()
 
 
-def single_demo(*, show=True, repeats=3):
-    if CLIENT is None:
-        raise RuntimeError("engine_not_started")
-    face = bytearray((ROOT / "public_demo/6.png").read_bytes())
-    reference = bytearray((ROOT / "public_demo/7.png").read_bytes())
-    previous = PRIVATE_IMAGES
-    globals()["PRIVATE_IMAGES"] = False
-    try:
-        return evaluate(face, reference, show=show, repeats=repeats)
-    finally:
-        globals()["PRIVATE_IMAGES"] = previous
-
-
-def _safe_relpath(value):
-    if not isinstance(value, str) or not value or "\\" in value:
-        raise ValueError("invalid_manifest_path")
-    path = PurePosixPath(value)
-    if path.is_absolute() or ".." in path.parts or path.suffix.lower() not in ALLOWED_IMAGE_SUFFIXES:
-        raise ValueError("invalid_manifest_path")
-    return value
+ID_PATTERN = re.compile(r'[ABC](0[1-9]|10)')
 
 
 def validate_manifest(cases):
-    if not isinstance(cases, list) or not cases:
-        raise ValueError("invalid_manifest")
-    seen = set()
+    if not isinstance(cases, list) or not 1 <= len(cases) <= 30:
+        raise ValueError('Manifest must contain 1..30 cases.')
+    ids = set()
     for case in cases:
-        if not isinstance(case, dict):
-            raise ValueError("invalid_manifest")
-        ident = case.get("id")
-        group = case.get("group")
-        if not isinstance(ident, str) or ident in seen or group not in {"A", "B", "C"}:
-            raise ValueError("invalid_manifest")
-        seen.add(ident)
-        _safe_relpath(case.get("target"))
-        if case.get("reference") is not None:
-            _safe_relpath(case.get("reference"))
+        if not isinstance(case, dict) or not ID_PATTERN.fullmatch(str(case.get('id', ''))):
+            raise ValueError('Use anonymous IDs A01..A10, B01..B10, C01..C10.')
+        if case['id'] in ids or case.get('group') != case['id'][0]:
+            raise ValueError('Duplicate ID or inconsistent group.')
+        ids.add(case['id'])
+        for key in ('target', 'reference'):
+            path = case.get(key)
+            if key == 'reference' and path is None:
+                continue
+            if not isinstance(path, str) or not path or '\\' in path:
+                raise ValueError('Invalid manifest image path.')
+            pure = PurePosixPath(path)
+            if pure.is_absolute() or '..' in pure.parts or pure.suffix.lower() not in {'.jpg','.jpeg','.png','.webp'}:
+                raise ValueError('Invalid manifest image path.')
     return cases
 
 
 @contextlib.contextmanager
-def zip_cases(blob):
-    if not isinstance(blob, (bytes, bytearray)) or not blob:
-        raise ValueError("invalid_zip")
-    raw = io.BytesIO(bytes(blob))
-    clear_buffer(blob)
-    archive = zipfile.ZipFile(raw, "r")
-    released = set()
-    loaded = {}
+def zip_cases(zip_bytes):
+    """Never extract. Drop compressed image members immediately after last use."""
+    stream = io.BytesIO(zip_bytes)
+    clear_buffer(zip_bytes)
     try:
-        infos = archive.infolist()
-        if len(infos) > 256:
-            raise ValueError("zip_too_many_entries")
-        total = 0
-        for info in infos:
-            if info.flag_bits & 0x1:
-                raise ValueError("encrypted_zip_not_supported")
-            if info.file_size > 25 * 1024 * 1024:
-                raise ValueError("zip_entry_too_large")
-            total += info.file_size
-            if total > 512 * 1024 * 1024:
-                raise ValueError("zip_uncompressed_too_large")
-            if info.compress_size and info.file_size / max(info.compress_size, 1) > 200:
-                raise ValueError("zip_compression_ratio_too_high")
-        if "manifest.json" not in archive.namelist():
-            raise ValueError("manifest_missing")
-        cases = json.loads(archive.read("manifest.json").decode("utf-8"))
-        validate_manifest(cases)
-
-        def loader(name):
-            _safe_relpath(name)
-            if name in released:
-                raise RuntimeError("zip_member_already_released")
-            if name not in archive.namelist():
-                raise FileNotFoundError(name)
-            value = bytearray(archive.read(name))
-            loaded[name] = value
-            return value
-
-        def release(name):
-            value = loaded.pop(name, None)
-            clear_buffer(value)
-            released.add(name)
-
-        yield cases, loader, release
+        with zipfile.ZipFile(stream) as archive:
+            infos = archive.infolist()
+            names = [x.filename for x in infos]
+            if len(names) > 256 or len(names) != len(set(names)):
+                raise ValueError('Invalid ZIP entry count / duplicate entries.')
+            if sum(x.file_size for x in infos) > 512 * 2**20:
+                raise ValueError('ZIP expansion limit exceeded.')
+            if any(x.flag_bits & 1 or x.file_size > 25 * 2**20 or
+                   x.file_size / max(1, x.compress_size) > 200 for x in infos):
+                raise ValueError('ZIP entry limits exceeded.')
+            if 'manifest.json' not in names:
+                raise ValueError('ZIP must include manifest.json at its root.')
+            info = archive.getinfo('manifest.json')
+            if info.file_size > 128 * 1024:
+                raise ValueError('Manifest too large.')
+            cases = validate_manifest(json.loads(archive.read('manifest.json')))
+            needed = [case[key] for case in cases for key in ('target', 'reference') if case.get(key)]
+            if any(name not in names for name in needed):
+                raise ValueError('Manifest refers to a missing image.')
+            remaining = Counter(needed)
+            def loader(name):
+                return bytearray(archive.read(name))
+            def release(name):
+                remaining[name] -= 1
+                if remaining[name] == 0:
+                    entry = archive.getinfo(name)
+                    view = stream.getbuffer()
+                    start = entry.header_offset
+                    header = struct.unpack_from('<4s5H3I2H', view, start)
+                    body_start = start + 30 + header[-2] + header[-1]
+                    view[body_start:body_start + entry.compress_size] = b'\0' * entry.compress_size
+                    view.release()
+            yield cases, loader, release
     finally:
-        for value in loaded.values():
-            clear_buffer(value)
-        archive.close()
-        raw.close()
+        clear_buffer(stream)
+        gc.collect()
 
 
 def record_scores(case, metrics):
-    labels = (("identity", "Identity"), ("hairline", "Hairline"), ("reference", "Reference"))
-    result = {}
-    for key, label in labels:
-        while True:
-            value = input(f"{case.get('id')} — {label} (1-5): ").strip()
-            if value in {"1", "2", "3", "4", "5"}:
-                result[key] = int(value)
-                break
-    return result
-
-
-def run_batch(cases, loader, *, preview_fn=None, score_fn=None, show=False,
-              save_dir=None, allow_public_export=False, release_fn=None):
-    validate_manifest(cases)
-    if PRIVATE_IMAGES and save_dir:
-        raise PermissionError("private_image_export_blocked")
-    if save_dir and not allow_public_export:
-        raise PermissionError("public_export_confirmation_required")
-    destination = Path(save_dir) if save_dir else None
-    if destination:
-        destination.mkdir(parents=True, exist_ok=True)
-    rows = []
-    for case in cases:
-        face = reference = None
-        response = None
+    """Human QA after public or transient private preview; never inferred from latency."""
+    print('Rate', case['id'], ': 1=unusable, 2=major errors, 3=visible issues, 4=acceptable, 5=excellent')
+    while True:
+        raw = input('Identity, Hairline, Reference (e.g. 4 4 5): ').split()
         try:
-            face = loader(case["target"])
-            if case.get("reference"):
-                reference = loader(case["reference"])
-            request = {
-                "op": "evaluate", "face": face, "reference": reference,
-                "repeats": 3, "return_images": bool(preview_fn or show or destination),
-                "debug_public": bool(show and not PRIVATE_IMAGES),
-            }
-            response = CLIENT.call(request)
-            metrics = dict(response.get("metrics", {}))
-            row = {"id": case["id"], "group": case["group"],
-                   "engine": getattr(CLIENT, "service", None), **metrics}
-            comparison = response.get("comparison_png")
-            output = response.get("output_png")
-            if destination and comparison is not None:
-                (destination / f"{case['id']}_comparison.png").write_bytes(bytes(comparison))
-                if output is not None:
-                    (destination / f"{case['id']}_result.png").write_bytes(bytes(output))
-            if preview_fn is not None and comparison is not None:
-                preview_fn(comparison)
-            elif show and comparison is not None:
-                show_comparison(comparison)
-            if score_fn is not None and row.get("status") == "ok":
-                scores = score_fn(case, row)
-                if scores:
-                    for key in ("identity", "hairline", "reference"):
-                        value = scores.get(key)
-                        if isinstance(value, bool) or value not in (1, 2, 3, 4, 5):
-                            raise ValueError("invalid_human_score")
-                        row[key] = int(value)
-            rows.append(row)
+            values = [int(x) for x in raw]
+            if len(values) == 3 and all(1 <= x <= 5 for x in values):
+                return dict(zip(('identity', 'hairline', 'reference'), values))
+        except ValueError:
+            pass
+        print('Enter three integer scores from 1 to 5.')
+
+
+def run_batch(cases, loader, *, release=None, show=False, score_fn=None,
+              save_dir=None, allow_public_export=False, repeats=3, reference_color=False, preview_fn=None):
+    """Sequential batch, no model reload/cache. Sink runs before output-buffer cleanup.
+    Private previews use the transient callback; exports stay blocked. Failures count.
+    """
+    validate_manifest(cases)
+    if PRIVATE_IMAGES and (show or save_dir is not None):
+        raise PermissionError('Private-image display/export is disabled.')
+    if save_dir is not None and not allow_public_export:
+        raise PermissionError('Set allow_public_export=True only for public/synthetic data.')
+    if CLIENT is None:
+        raise RuntimeError('Start an engine before running a batch.')
+    records = []
+    for case in cases:
+        face = reference = response = None
+        row = {'id': case['id'], 'group': case['group'], 'engine': CLIENT.service,
+               'identity': None, 'hairline': None, 'reference': None}
+        try:
+            face = loader(case['target'])
+            reference = loader(case['reference']) if case.get('reference') else None
+            response = evaluate(face, reference, show=show, retain_output=save_dir is not None,
+                                repeats=repeats, reference_color=reference_color, preview_fn=preview_fn)
+            metrics = response['metrics'] if save_dir is not None else response
+            row.update(metrics)
+            if metrics['status'] == 'ok':
+                if save_dir is not None:
+                    dest = Path(save_dir)
+                    dest.mkdir(parents=True, exist_ok=True)
+                    (dest / (case['id'] + '_result.png')).write_bytes(response['output_png'])
+                    (dest / (case['id'] + '_comparison.png')).write_bytes(response['comparison_png'])
+                    print('Public comparison ready:', dest / (case['id'] + '_comparison.png'))
+                if score_fn is not None:
+                    ratings = score_fn(case, metrics)
+                    if ratings:
+                        for key in ('identity', 'hairline', 'reference'):
+                            if isinstance(ratings.get(key), bool) or not isinstance(ratings.get(key), int) or not 1 <= ratings[key] <= 5:
+                                raise ValueError('Invalid score.')
+                        row.update(ratings)
         except Exception as exc:
-            rows.append({"id": case.get("id"), "group": case.get("group"),
-                         "engine": getattr(CLIENT, "service", None),
-                         "status": "error", "error_code": type(exc).__name__})
+            row.update(status='error', error_code=type(exc).__name__)
         finally:
             clear_buffer(face)
             clear_buffer(reference)
-            if response:
-                clear_buffer(response.get("output_png"))
-                clear_buffer(response.get("comparison_png"))
-                response.clear()
-            if release_fn:
-                release_fn(case.get("target"))
-                if case.get("reference"):
-                    release_fn(case.get("reference"))
-    return rows
+            if isinstance(response, dict):
+                clear_buffer(response.get('output_png'))
+                clear_buffer(response.get('comparison_png'))
+            if release:
+                for key in ('target', 'reference'):
+                    if case.get(key):
+                        release(case[key])
+        records.append(row)
+        print(case['id'], row['status'], 'inference_s=', row.get('inference_s'),
+              'peak_MiB=', row.get('peak_allocated_mib'), 'error=', row.get('error_code'))
+    return records
 
 
-def _expected_ids():
-    return {f"{group}{i:02d}" for group in "ABC" for i in range(1, 11)}
+def batch_zip_demo(*, show=False, score_fn=None, save_dir=None, allow_public_export=False, preview_fn=None):
+    blob = pick_bytes('Choose ZIP with manifest.json and images', zip_input=True)
+    try:
+        with zip_cases(blob) as (cases, loader, release):
+            return run_batch(cases, loader, release=release, show=show, score_fn=score_fn,
+                             save_dir=save_dir, allow_public_export=allow_public_export, preview_fn=preview_fn)
+    finally:
+        clear_buffer(blob)
 
 
-def quality_gate(records, seconds=8.0):
-    rows = list(records)
-    ids = [row.get("id") for row in rows]
-    if len(rows) != 30 or set(ids) != _expected_ids() or len(set(ids)) != 30:
-        return {"gate": "INCOMPLETE", "denominator": 30, "quality_passes": 0, "joint_passes": 0}
-    engines = {row.get("engine") for row in rows}
-    if len(engines) != 1:
-        return {"gate": "INCOMPLETE", "denominator": 30, "quality_passes": 0, "joint_passes": 0}
-    assessed = True
-    quality = 0
-    joint = 0
-    latencies = []
-    for row in rows:
-        if row.get("status") != "ok":
-            continue
-        ratings = [row.get(k) for k in ("identity", "hairline", "reference")]
-        latency = row.get("inference_s")
-        if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)) for v in ratings):
-            assessed = False
-            continue
-        if not isinstance(latency, (int, float)) or isinstance(latency, bool) or not math.isfinite(float(latency)):
-            assessed = False
-            continue
-        latencies.append(float(latency))
-        q = all(float(v) >= 4 for v in ratings)
-        quality += int(q)
-        joint += int(q and float(latency) < float(seconds))
-    gate = "UNASSESSED" if not assessed else ("PASS" if quality >= 21 and joint >= 21 else "FAIL")
-    result = {"gate": gate, "denominator": 30, "quality_passes": quality, "joint_passes": joint}
-    if latencies:
-        ordered = sorted(latencies)
-        result["p95_inference_s"] = ordered[min(len(ordered)-1, math.ceil(.95*len(ordered))-1)]
-    return result
-
-
-def export_metrics(records, path, seconds=8.0):
-    path = Path(path)
-    rows = list(records)
-    fields = sorted({key for row in rows for key in row})
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(rows)
-    path.with_suffix(".json").write_text(
-        json.dumps({"gate": quality_gate(rows, seconds=seconds), "records": rows},
-                   ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-
-def batch_folder(folder, **kwargs):
+def batch_folder(folder, *, show=False, score_fn=None, save_dir=None, allow_public_export=False, preview_fn=None):
+    """Read a pre-existing folder without modifying input files. PUBLIC DATA ONLY.
+    Strict private runs use memory upload instead of creating folders on Colab.
+    """
     if PRIVATE_IMAGES:
-        raise PermissionError("private_folder_mode_blocked")
-    folder = Path(folder)
-    cases = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
-    validate_manifest(cases)
+        raise PermissionError('Folder mode is restricted to pre-existing public/synthetic datasets.')
+    root = Path(folder).resolve()
+    cases = validate_manifest(json.loads((root / 'manifest.json').read_text()))
     def loader(name):
-        return bytearray((folder / _safe_relpath(name)).read_bytes())
-    return run_batch(cases, loader, **kwargs)
+        path = (root / name).resolve()
+        if not path.is_relative_to(root) or not path.is_file() or path.stat().st_size > 25 * 2**20:
+            raise ValueError('Invalid image path.')
+        return bytearray(path.read_bytes())
+    return run_batch(cases, loader, show=show, score_fn=score_fn, save_dir=save_dir,
+                     allow_public_export=allow_public_export, preview_fn=preview_fn)
 
 
-def batch_zip_demo(blob=None, *, preview_fn=None, score_fn=None, show=False,
-                   save_dir=None, allow_public_export=False):
-    if blob is None:
-        raise ValueError("zip_bytes_required")
-    with zip_cases(blob) as (cases, loader, release):
-        return run_batch(cases, loader, preview_fn=preview_fn, score_fn=score_fn,
-                         show=show, save_dir=save_dir,
-                         allow_public_export=allow_public_export, release_fn=release)
+def percentile(values, p):
+    ordered = sorted(values)
+    if not ordered:
+        return None
+    k = (len(ordered) - 1) * p / 100
+    lo, hi = int(k), min(int(k) + 1, len(ordered) - 1)
+    return ordered[lo] * (hi - k) + ordered[hi] * (k - lo) if hi != lo else ordered[lo]
+
+
+def quality_gate(records, *, threshold=4, seconds=8., latency_key='inference_s'):
+    """Provisional preregistered rubric: ALL 3 quality scores >=4.
+    Gate: full 30 (10/group), >=21 quality passes AND >=21 joint quality/latency
+    passes. P95 is reported separately, not added to the user's gate. Failures count in /30.
+    Missing ratings => UNASSESSED. Different engines may not be pooled.
+    """
+    expected_ids = {f'{g}{i:02d}' for g in 'ABC' for i in range(1, 11)}
+    actual = [r.get('id') for r in records]
+    engines = {r.get('engine') for r in records}
+    full = len(actual) == 30 and set(actual) == expected_ids and len(set(actual)) == 30
+    full = full and all(r.get('group') == r['id'][0] for r in records) and len(engines) == 1
+    if not 1 <= threshold <= 5 or seconds <= 0:
+        raise ValueError('Invalid gate threshold.')
+    quality = joint = 0
+    missing_latency = 0
+    missing = 0
+    groups = {g: {'total': 0, 'quality_pass': 0, 'joint_pass': 0, 'errors': 0} for g in 'ABC'}
+    times = []
+    for row in records:
+        group = groups.get(row.get('group'))
+        if group is None:
+            continue
+        group['total'] += 1
+        if row.get('status') != 'ok':
+            group['errors'] += 1
+            continue
+        latency = row.get(latency_key)
+        if isinstance(latency, (int, float)) and math.isfinite(latency) and latency >= 0:
+            times.append(latency)
+        else:
+            latency = None
+            missing_latency += 1
+        values = [row.get(k) for k in ('identity', 'hairline', 'reference')]
+        valid = all(isinstance(x, int) and not isinstance(x, bool) and 1 <= x <= 5 for x in values)
+        if not valid:
+            missing += 1
+            continue
+        good = min(values) >= threshold and not row.get('identity_hard_fail', False)
+        fast = latency is not None and latency < seconds
+        quality += int(good)
+        joint += int(good and fast)
+        group['quality_pass'] += int(good)
+        group['joint_pass'] += int(good and fast)
+    p95 = percentile(times, 95)
+    if not full:
+        status = 'INCOMPLETE'
+    elif missing or missing_latency:
+        status = 'UNASSESSED'
+    elif quality >= 21 and joint >= 21:
+        status = 'PASS'
+    else:
+        status = 'FAIL'
+    return {'gate': status, 'full_protocol': full, 'quality_passes': quality,
+            'joint_passes': joint, 'denominator': 30, 'quality_pass_rate': quality / 30,
+            'joint_pass_rate': joint / 30, 'unrated_successes': missing,
+            'missing_latency': missing_latency,
+            'latency_metric': latency_key, 'median_s': percentile(times, 50), 'p95_s': p95,
+            'seconds_limit_exclusive': seconds, 'groups': groups,
+            'note': 'Scores >=4 are a proposed operational rubric; agree before collecting results.'}
+
+
+# Non-image reports only: no source paths, original names, photos or latent embeddings.
+import math
+
+def export_metrics(records, path='/content/beauty_phase0/metrics.csv', seconds=8.):
+    keys = ['id','group','engine','status','error_code','identity','hairline','reference',
+            'inference_s','alignment_s','pipeline_s','decode_s','peak_allocated_mib',
+            'peak_reserved_mib','nvml_process_peak_mib','nvml_device_peak_mib','repeats']
+    with open(path, 'w', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=keys, extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(records)
+    metadata_path = str(Path(path).with_suffix('.json'))
+    with open(metadata_path, 'w') as stream:
+        json.dump({'gate': quality_gate(records, seconds=seconds), 'records': records}, stream, indent=2)
+    print('Saved anonymous metrics CSV and JSON:', path, metadata_path)
