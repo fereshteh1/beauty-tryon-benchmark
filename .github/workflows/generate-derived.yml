@@ -1,0 +1,39 @@
+name: Generate derived files
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Generate worker and notebook
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          Path("engine/worker.py").write_text(
+              Path("engine/core.py").read_text() + "\n\n" + Path("engine/worker_tail.py").read_text()
+          )
+          PY
+          python scripts/build_notebook.py
+      - name: Commit generated files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add engine/worker.py notebooks/Beauty_TryOn_Phase0_T4.ipynb
+          if git diff --cached --quiet; then
+            echo "Derived files are already current."
+          else
+            git commit -m "Generate derived worker and standalone Colab notebook"
+            git push
+          fi
