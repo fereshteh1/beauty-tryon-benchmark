@@ -1,0 +1,13 @@
+{
+  "profile": "FP32_batch1_seed3407_no_poisson",
+  "hairfastgan_code_revision": "49e98019c9243d1991c19d45764fc3340a498de2",
+  "hairfastgan_weights_revision": "47855f8ea72b02294649385211a1ae1fd7dcb58e",
+  "segformer_model": "isjackwild/segformer-b0-finetuned-segments-skin-hair-clothing",
+  "segformer_revision": "dd02ee5b73017377ba6f12a58c3e300cbbfd58c8",
+  "clip_code_revision": "a1d071733d7111c9c014f024669f959182114e33",
+  "python": "3.10",
+  "torch": "2.2.2+cu121",
+  "default_operator_backend_requested": "auto",
+  "batch_repeats": 3,
+  "interactive_repeats": 1
+}
