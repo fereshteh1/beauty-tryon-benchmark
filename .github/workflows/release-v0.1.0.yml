@@ -1,0 +1,68 @@
+name: Publish v0.1.0
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/release-v0.1.0.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view v0.1.0 >/dev/null 2>&1; then
+            echo "v0.1.0 already exists."
+            exit 0
+          fi
+
+          TARGET="$(git rev-parse HEAD^)"
+          cat > release-notes.md <<'EOF'
+          ## Beauty Try-On Benchmark v0.1.0 — Phase-zero release
+
+          This is the first public phase-zero release of **Beauty Try-On Benchmark**, an open-source evaluation and orchestration harness for hair virtual try-on experiments in Google Colab.
+
+          ### Included
+          - HairFastGAN hairstyle/reference-color pipeline.
+          - Independent SegFormer-B0 + LAB hair recoloring baseline.
+          - Reproducible Colab/Tesla T4 workflow with pinned upstream revisions.
+          - Latency, pipeline-time and GPU-memory measurements.
+          - Transient private-image handling and explicit privacy controls.
+          - CPU tests, runtime tests, operator checks and release validation.
+          - A preregistered 30-image benchmark protocol with anonymous IDs and human quality scoring.
+
+          ### Validation evidence
+          A separately maintained professional Colab prototype was run on **2026-10-05** on a **Tesla T4** with Python 3.10 and PyTorch 2.2.2+cu121. The saved run records CUDA arithmetic success, **12/12 core tests**, **9/9 runtime tests**, and the pinned operator check.
+
+          Single-demo observations from that run:
+          - HairFastGAN: **2.061 s** inference, **10.242 s** pipeline, **6905.4 MiB** peak CUDA allocated.
+          - SegFormer + LAB: **0.142 s** inference, **0.151 s** pipeline, **305.2 MiB** peak CUDA allocated.
+
+          These are feasibility observations, **not** the complete 30-image benchmark and not a claim that every repository revision has been GPU-validated byte-for-byte.
+
+          ### Current limitations
+          - The full 30-image quality gate has **not yet been run**.
+          - This is not a production salon application, mobile app, database or customer-facing product.
+          - StableHair v2, PSGAN/SCGAN and makeup presets are not implemented in this release.
+          - Third-party models and weights retain their own licenses and usage restrictions.
+
+          ### Copyright and licensing
+          Original repository code and documentation: **© 2026 Fereshteh Abolghasemi**, released under the MIT License.
+
+          Publishing under MIT grants broad reuse rights but does not transfer copyright ownership. Third-party components, including HairFastGAN, SEAN, CLIP and SegFormer, remain subject to their respective licenses and notices in `THIRD_PARTY_NOTICES.md`.
+
+          This release is intentionally marked **pre-release** because the project is still in phase zero and the full benchmark is pending.
+          EOF
+
+          gh release create v0.1.0             --target "$TARGET"             --title "v0.1.0 — Phase-zero release"             --notes-file release-notes.md             --prerelease
