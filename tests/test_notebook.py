@@ -22,6 +22,7 @@ for cell in cells:
 source=''.join(cells[15]['source']).replace('/content/beauty_phase0',str(root))
 tree=ast.parse(source)
 assert isinstance(tree.body[-1],ast.With)
+# Keep actual worker assembly and imports; exclude only GPU verification.
 tree.body=tree.body[:-1]
 exec(compile(tree,'<fresh-notebook-assembly>','exec'))
 import runtime,controller,photo_preview,hair_engine,color_engine

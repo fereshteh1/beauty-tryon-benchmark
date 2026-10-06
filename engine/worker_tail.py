@@ -75,6 +75,10 @@ class MemorySampler:
         self.thread.join(timeout=1)
 
 
+
+
+
+
 def evaluate(engine, request, provenance):
     import torch
     face = reference = result = aligned = aligned_ref = frame = None
