@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+message: "If you use this benchmark harness, cite the repository and the upstream model papers in THIRD_PARTY_NOTICES.md."
+title: "Beauty Try-On Benchmark"
+type: software
+version: 0.1.0
+date-released: 2026-10-05
+authors:
+  - given-names: "Fereshteh"
+    family-names: "Abolghasemi"
+license: MIT
+abstract: "Phase-zero Colab orchestration, LAB hair recoloring and latency/VRAM evaluation around existing hair try-on research models."
