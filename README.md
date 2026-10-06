@@ -1,8 +1,15 @@
 # Beauty Try-On Benchmark
 
+[![CPU tests and release validation](https://github.com/fereshteh1/beauty-tryon-benchmark/actions/workflows/ci.yml/badge.svg)](https://github.com/fereshteh1/beauty-tryon-benchmark/actions/workflows/ci.yml)
+
 Phase-zero feasibility and benchmarking tools for salon hair consultation. Give a target portrait and a hair reference to the Colab notebook, receive a visual approximation, and measure latency and GPU memory. This repository contributes orchestration, LAB recoloring, privacy controls, tests and a benchmark protocol around existing research models. It does not train or claim authorship of HairFastGAN.
 
 [Open the validated Colab prototype](https://colab.research.google.com/drive/1B8Mj0FYPIQ4B9N0EQ2L5t2udpY1YKp4t?usp=sharing) · [راهنمای فارسی](README_FA.md) · [Colab instructions](docs/COLAB.md) · [Benchmark protocol](docs/BENCHMARK.md) · [Privacy](docs/PRIVACY.md) · [Copyright](COPYRIGHT.md) · [Licenses](THIRD_PARTY_NOTICES.md)
+
+## Project status
+
+**v0.1.0 is a public phase-zero pre-release.** CPU CI is passing, a Tesla T4 feasibility run is documented, and the reproducible benchmark harness is available now. The complete real 30-image quality gate is still pending and is tracked as the next validation milestone.
+
 
 ## What is included
 
