@@ -8,7 +8,7 @@ Open the standalone notebook, choose T4 GPU, and run cells in order. The noteboo
 
 | Condition | Action |
 |---|---|
-| `pkg_resourcesn/CLIP build failure | This release pins setuptools/wheel and disables build isolation for CLIP. Rerun cell 4; keep the actual installer diagnostic if it still fails. |
+| `pkg_resources`/CLIP build failure | This release pins setuptools/wheel and disables build isolation for CLIP. Rerun cell 4; keep the actual installer diagnostic if it still fails. |
 | Runtime/model files missing | Recreate the setup in cells 1–16. Saved notebook outputs do not restore runtime files. |
 | GPU missing | Select T4 in runtime settings, then rerun preparation in the resulting runtime. |
 | `I/O operation on closed file` for PNG | The release includes the ownership/close fix in cell 7. Use this complete notebook rather than old patch cells. |
