@@ -91,7 +91,7 @@ section(13, 'تست‌های تصویر و گیت', 'JPEG/PNG/WEBP، متادی�
 section(14, 'تست ارتباط و Runtime', 'Timeout، خطای نصب، پاکسازی و جلوگیری از نتیجهٔ قدیمی.', file='tests/test_runtime.py')
 section(15, 'تست شش اپراتور', 'در سلامت GPU با assets واقعی اجرا می‌شود؛ CI بدون مدل آن را skip می‌کند.', file='tests/test_operators.py')
 section(16, 'ساخت worker و اجرای سلامت', 'محاسبهٔ CUDA و ۲۶ تست اولیه؛ این مرحله جای استنتاج مدل را نمی‌گیرد.', LOAD+'''\nimport ast
-worker = (ctx.CODE_ROOT/'core.py').read_text()+'\n\n'+(ctx.CODE_ROOT/'worker_tail.py').read_text()
+worker = (ctx.CODE_ROOT/'core.py').read_text()+'\\n\\n'+(ctx.CODE_ROOT/'worker_tail.py').read_text()
 ast.parse(worker)
 (ctx.CODE_ROOT/'worker.py').write_text(worker)
 with ctx.stage(16, 'سلامت CUDA و تست‌ها'):
